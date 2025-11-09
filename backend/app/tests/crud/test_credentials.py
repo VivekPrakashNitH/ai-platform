@@ -233,25 +233,25 @@ def test_invalid_provider(db: Session) -> None:
         )
 
 
-def test_duplicate_provider_credentials(db: Session) -> None:
-    """Test handling of duplicate provider credentials."""
+def test_multiple_credentials_per_provider(db: Session) -> None:
+    """Test that multiple credentials can exist for the same provider, but only one is active."""
     project = create_test_project(db)
 
-    # Set up initial credentials
-    credentials_data = {"openai": {"api_key": "test-key"}}
+    # Set up initial active credentials
+    credentials_data = {"openai": {"api_key": "test-key-1"}}
 
     credentials_create = CredsCreate(
         is_active=True,
         credential=credentials_data,
     )
-    set_creds_for_org(
+    first_creds = set_creds_for_org(
         session=db,
         creds_add=credentials_create,
         organization_id=project.organization_id,
         project_id=project.id,
     )
 
-    # Verify credentials exist and are active
+    # Verify first credentials exist and are active
     existing_creds = get_provider_credential(
         session=db,
         org_id=project.organization_id,
@@ -260,7 +260,63 @@ def test_duplicate_provider_credentials(db: Session) -> None:
     )
     assert existing_creds is not None
     assert "api_key" in existing_creds
-    assert existing_creds["api_key"] == "test-key"
+    assert existing_creds["api_key"] == "test-key-1"
+
+    # Create a second credential with is_active=False (should be allowed)
+    credentials_data_2 = {"openai": {"api_key": "test-key-2"}}
+    credentials_create_2 = CredsCreate(
+        is_active=False,
+        credential=credentials_data_2,
+    )
+    second_creds = set_creds_for_org(
+        session=db,
+        creds_add=credentials_create_2,
+        organization_id=project.organization_id,
+        project_id=project.id,
+    )
+
+    # Verify we can have multiple credentials
+    all_creds = get_creds_by_org(
+        session=db,
+        org_id=project.organization_id,
+        project_id=project.id,
+    )
+    openai_creds = [c for c in all_creds if c.provider == "openai"]
+    assert len(openai_creds) == 2
+
+    # Verify only the first one is active
+    active_creds = [c for c in openai_creds if c.is_active]
+    assert len(active_creds) == 1
+    assert active_creds[0].id == first_creds[0].id
+
+    # Create a third credential with is_active=True (should deactivate the first one)
+    credentials_data_3 = {"openai": {"api_key": "test-key-3"}}
+    credentials_create_3 = CredsCreate(
+        is_active=True,
+        credential=credentials_data_3,
+    )
+    third_creds = set_creds_for_org(
+        session=db,
+        creds_add=credentials_create_3,
+        organization_id=project.organization_id,
+        project_id=project.id,
+    )
+
+    # Verify the new one is active and the first one is deactivated
+    db.refresh(first_creds[0])
+    db.refresh(third_creds[0])
+    assert first_creds[0].is_active is False
+    assert third_creds[0].is_active is True
+
+    # Verify get_provider_credential returns the active one
+    active_cred = get_provider_credential(
+        session=db,
+        org_id=project.organization_id,
+        provider="openai",
+        project_id=project.id,
+    )
+    assert active_cred is not None
+    assert active_cred["api_key"] == "test-key-3"
 
 
 def test_langfuse_credential_validation(db: Session) -> None:

@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 def set_creds_for_org(
     *, session: Session, creds_add: CredsCreate, organization_id: int, project_id: int
 ) -> list[Credential]:
-    """Set credentials for an organization. Creates a separate row for each provider."""
+    """Set credentials for an organization. Creates a separate row for each provider.
+    If is_active=True, deactivates any existing active credentials for the same provider.
+    """
     created_credentials = []
 
     if not creds_add.credential:
@@ -30,6 +32,22 @@ def set_creds_for_org(
         # Validate provider and credentials
         validate_provider(provider)
         validate_provider_credentials(provider, credentials)
+
+        # If creating an active credential, deactivate existing active credentials
+        # for the same provider to ensure only one is active at a time
+        if creds_add.is_active:
+            existing_active = session.exec(
+                select(Credential).where(
+                    Credential.organization_id == organization_id,
+                    Credential.project_id == project_id,
+                    Credential.provider == provider,
+                    Credential.is_active.is_(True),
+                )
+            ).all()
+            for existing in existing_active:
+                existing.is_active = False
+                existing.updated_at = now()
+                session.add(existing)
 
         # Encrypt entire credentials object
         encrypted_credentials = encrypt_credentials(credentials)
@@ -54,14 +72,11 @@ def set_creds_for_org(
                 f"[set_creds_for_org] Integrity error while adding credentials | organization_id {organization_id}, project_id {project_id}, provider {provider}: {str(e)}",
                 exc_info=True,
             )
-            # Check if it's a duplicate constraint violation
-            if (
-                "uq_credential_org_project_provider" in str(e)
-                or "unique constraint" in str(e).lower()
-            ):
+            # Check if it's a partial unique index violation (multiple active credentials)
+            if "uq_credential_org_project_provider_active" in str(e):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Credentials for provider '{provider}' already exist for this organization and project combination",
+                    detail=f"Multiple active credentials for provider '{provider}' are not allowed. Please deactivate existing active credentials first.",
                 )
             raise ValueError(
                 f"Error while adding credentials for provider {provider}: {str(e)}"
@@ -127,7 +142,8 @@ def get_provider_credential(
     full: bool = False,
 ) -> dict[str, Any] | Credential | None:
     """
-    Fetch credentials for a specific provider within a project.
+    Fetch active credentials for a specific provider within a project.
+    Returns the active credential if available, otherwise returns None.
 
     Args:
         session: Database session
@@ -137,19 +153,22 @@ def get_provider_credential(
         full: If True, returns full Credential object; otherwise returns decrypted dict
 
     Returns:
-        dict[str, Any] | Credential:
+        dict[str, Any] | Credential | None:
             - If `full` is True, returns the full Credential SQLModel object.
             - Otherwise, returns the decrypted credentials as a dictionary.
+            - Returns None if no active credentials are found.
 
     Raises:
         HTTPException: If credentials are not found
     """
     validate_provider(provider)
 
+    # Always fetch the active credential
     statement = select(Credential).where(
         Credential.organization_id == org_id,
         Credential.provider == provider,
         Credential.project_id == project_id,
+        Credential.is_active.is_(True),
     )
     creds = session.exec(statement).one_or_none()
 
@@ -172,7 +191,9 @@ def update_creds_for_org(
     project_id: int,
     creds_in: CredsUpdate,
 ) -> list[Credential]:
-    """Updates credentials for a specific provider of an organization."""
+    """Updates credentials for a specific provider of an organization.
+    If is_active is being set to True, deactivates other active credentials for the same provider.
+    """
     if not creds_in.provider or not creds_in.credential:
         raise ValueError("Provider and credential must be provided")
 
@@ -182,6 +203,7 @@ def update_creds_for_org(
     # Encrypt the entire credentials object
     encrypted_credentials = encrypt_credentials(creds_in.credential)
 
+    # Find the active credential to update
     statement = select(Credential).where(
         Credential.organization_id == org_id,
         Credential.provider == creds_in.provider,
@@ -191,13 +213,31 @@ def update_creds_for_org(
     creds = session.exec(statement).one_or_none()
     if creds is None:
         logger.error(
-            f"[update_creds_for_org] Credentials not found | organization {org_id}, provider {creds_in.provider}, project_id {project_id}"
+            f"[update_creds_for_org] Active credentials not found | organization {org_id}, provider {creds_in.provider}, project_id {project_id}"
         )
         raise HTTPException(
-            status_code=404, detail="Credentials not found for this provider"
+            status_code=404, detail="Active credentials not found for this provider"
         )
 
+    # If setting is_active to True, deactivate other active credentials
+    if creds_in.is_active is True:
+        other_active = session.exec(
+            select(Credential).where(
+                Credential.organization_id == org_id,
+                Credential.provider == creds_in.provider,
+                Credential.project_id == project_id,
+                Credential.is_active.is_(True),
+                Credential.id != creds.id,
+            )
+        ).all()
+        for other in other_active:
+            other.is_active = False
+            other.updated_at = now()
+            session.add(other)
+
     creds.credential = encrypted_credentials
+    if creds_in.is_active is not None:
+        creds.is_active = creds_in.is_active
     creds.updated_at = now()
     session.add(creds)
     session.commit()
@@ -211,34 +251,34 @@ def update_creds_for_org(
 def remove_provider_credential(
     session: Session, org_id: int, project_id: int, provider: str
 ) -> None:
-    """Remove credentials for a specific provider.
+    """Remove all credentials for a specific provider (both active and inactive).
 
     Raises:
         HTTPException: If credentials not found or deletion fails
     """
     validate_provider(provider)
 
-    # Verify credentials exist before attempting delete
-    creds = get_provider_credential(
-        session=session,
-        org_id=org_id,
-        project_id=project_id,
-        provider=provider,
+    # Verify credentials exist before attempting delete (check for any, not just active)
+    statement = select(Credential).where(
+        Credential.organization_id == org_id,
+        Credential.provider == provider,
+        Credential.project_id == project_id,
     )
-    if creds is None:
+    creds = session.exec(statement).all()
+    if not creds:
         raise HTTPException(
             status_code=404, detail="Credentials not found for this provider"
         )
 
-    # Build delete statement
-    statement = delete(Credential).where(
+    # Build delete statement to remove all credentials for this provider
+    delete_statement = delete(Credential).where(
         Credential.organization_id == org_id,
         Credential.provider == provider,
         Credential.project_id == project_id,
     )
 
     # Execute and get affected rows
-    result = session.exec(statement)
+    result = session.exec(delete_statement)
 
     rows_deleted = result.rowcount
     if rows_deleted == 0:
@@ -252,7 +292,7 @@ def remove_provider_credential(
         )
     session.commit()
     logger.info(
-        f"[remove_provider_credential] Successfully deleted credential | provider {provider}, organization_id {org_id}, project_id {project_id}"
+        f"[remove_provider_credential] Successfully deleted {rows_deleted} credential(s) | provider {provider}, organization_id {org_id}, project_id {project_id}"
     )
 
 

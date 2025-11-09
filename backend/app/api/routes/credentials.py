@@ -24,7 +24,7 @@ router = APIRouter(prefix="/credentials", tags=["credentials"])
     "/",
     response_model=APIResponse[list[CredsPublic]],
     summary="Create new credentials for the current organization and project",
-    description="Creates new credentials for the caller's organization and project. Each organization can have different credentials for different providers and projects. Only one credential per provider is allowed per organization-project combination.",
+    description="Creates new credentials for the caller's organization and project. Multiple credentials can exist for the same provider, but only one can be active at a time. If creating an active credential, any existing active credentials for the same provider will be automatically deactivated.",
 )
 def create_new_credential(
     *,
@@ -33,7 +33,7 @@ def create_new_credential(
     _current_user: UserProjectOrg = Depends(get_current_user_org_project),
 ):
     # Project comes from API key context; no cross-org check needed here
-    # Database unique constraint ensures no duplicate credentials per provider-org-project combination
+    # Multiple credentials allowed per provider, but only one can be active at a time
 
     created_creds = set_creds_for_org(
         session=session,

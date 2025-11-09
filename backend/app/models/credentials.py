@@ -48,16 +48,9 @@ class CredsUpdate(SQLModel):
 class Credential(CredsBase, table=True):
     """Database model for storing provider credentials.
     Each row represents credentials for a single provider.
+    Multiple credentials can exist for the same project_id and provider,
+    but only one can be active at a time (enforced by partial unique index).
     """
-
-    __table_args__ = (
-        sa.UniqueConstraint(
-            "organization_id",
-            "project_id",
-            "provider",
-            name="uq_credential_org_project_provider",
-        ),
-    )
 
     id: int = Field(default=None, primary_key=True)
     provider: str = Field(
