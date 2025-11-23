@@ -52,10 +52,10 @@ class Credential(CredsBase, table=True):
 
     __table_args__ = (
         sa.UniqueConstraint(
-            "organization_id",
             "project_id",
             "provider",
-            name="uq_credential_org_project_provider",
+            "is_active",
+            name="uq_credential_project_provider_is_active",
         ),
     )
 
